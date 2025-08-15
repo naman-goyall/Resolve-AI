@@ -4,6 +4,12 @@ services:
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     ports:
       - "6379:6379"
     volumes:
@@ -13,6 +19,7 @@ services:
     build:
       context: .
       dockerfile: ./services/collector/Dockerfile
+    restart: unless-stopped
     environment:
       - REDIS_ADDR=redis://redis:6379/0
       - STREAM_NAME=logs
@@ -21,6 +28,12 @@ services:
       - CORS_ALLOW_ORIGINS=http://localhost:8080
     depends_on:
       - redis
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8081/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
     ports:
       - "8081:8081"
 
@@ -28,6 +41,7 @@ services:
     build:
       context: .
       dockerfile: ./services/distributor/Dockerfile
+    restart: unless-stopped
     environment:
       - REDIS_ADDR=redis://redis:6379/0
       - STREAM_NAME=logs
@@ -40,6 +54,12 @@ services:
       - CORS_ALLOW_ORIGINS=http://localhost:8080
     depends_on:
       - redis
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8082/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
     ports:
       - "8082:8082"
 
@@ -47,6 +67,7 @@ services:
     build:
       context: .
       dockerfile: ./services/distributor/Dockerfile
+    restart: unless-stopped
     environment:
       - REDIS_ADDR=redis://redis:6379/0
       - STREAM_NAME=logs
@@ -59,15 +80,28 @@ services:
       - CORS_ALLOW_ORIGINS=http://localhost:8080
     depends_on:
       - redis
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8082/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
 
   ui:
     build:
       context: .
       dockerfile: ./services/ui/Dockerfile
+    restart: unless-stopped
     environment:
       - DISTRIBUTOR_HTTP=http://localhost:8082
     depends_on:
       - distributor
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
     ports:
       - "8080:8080"
 

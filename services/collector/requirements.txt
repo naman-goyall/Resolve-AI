@@ -3,5 +3,6 @@ uvicorn[standard]==0.30.6
 redis==5.0.7
 pydantic==2.8.2
 orjson==3.10.7
+prometheus_client==0.20.0
 
 

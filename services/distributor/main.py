@@ -8,7 +8,8 @@ import orjson
 import contextlib
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
+from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from redis.asyncio import Redis
 
 
@@ -28,7 +29,7 @@ ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("distributor")
 
-app = FastAPI(title="Logs Distributor", version="1.1")
+app = FastAPI(title="Logs Distributor", version="1.3")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOW_ORIGINS,
@@ -44,6 +45,11 @@ subscriber_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 bg_task: Optional[asyncio.Task] = None
 pubsub_task: Optional[asyncio.Task] = None
 pubsub_obj = None
+
+# Metrics
+PUB_TOTAL = Counter("distributor_published_total", "Total events published to subscribers")
+PUB_ERRORS = Counter("distributor_errors_total", "Distributor errors", ["where"])
+SSE_CONNECTIONS = Gauge("distributor_sse_connections", "Active SSE connections")
 
 
 async def ensure_group(redis: Redis) -> None:
@@ -114,8 +120,10 @@ async def consume_loop() -> None:
                 # publish to Redis channel for cross-instance fanout
                 try:
                     await redis_client.publish(BROADCAST_CHANNEL, raw)
+                    PUB_TOTAL.inc()
                 except Exception as exc:
                     logger.exception("Distributor: publish failed: %s", exc)
+                    PUB_ERRORS.labels(where="publish").inc()
                 ids_to_ack.append(msg_id)
 
             if ids_to_ack:
@@ -149,10 +157,12 @@ async def pubsub_loop() -> None:
                 except Exception:
                     continue
             for sid, q in list(subscriber_queues.items()):
-                try:
-                    q.append(data)
-                except Exception:
-                    pass
+                lock = subscriber_locks[sid]
+                async with lock:
+                    try:
+                        q.append(data)
+                    except Exception:
+                        pass
     finally:
         with contextlib.suppress(Exception):
             await pubsub_obj.unsubscribe(BROADCAST_CHANNEL)
@@ -204,19 +214,22 @@ async def healthz() -> dict:
     assert redis_client is not None
     try:
         pong = await redis_client.ping()
-        return {"status": "ok", "redis": pong, "subscribers": len(subscriber_queues)}
+        return {"status": "ok", "redis": pong, "subscribers": len(subscriber_queues), "group": CONSUMER_GROUP, "consumer": CONSUMER_NAME}
     except Exception as exc:  # noqa: BLE001
         return {"status": "degraded", "error": str(exc)}
 
 
 async def sse_event_stream(sid: str) -> AsyncIterator[bytes]:
     try:
+        SSE_CONNECTIONS.inc()
         while True:
             q = subscriber_queues[sid]
             if q:
                 # drain queue quickly without blocking
                 while q:
-                    raw = q.popleft()
+                    lock = subscriber_locks[sid]
+                    async with lock:
+                        raw = q.popleft()
                     try:
                         data = raw.decode()
                     except Exception:
@@ -233,6 +246,11 @@ async def sse_event_stream(sid: str) -> AsyncIterator[bytes]:
             del subscriber_queues[sid]
         except KeyError:
             pass
+        try:
+            del subscriber_locks[sid]
+        except KeyError:
+            pass
+        SSE_CONNECTIONS.dec()
 
 
 @app.get("/subscribe")
@@ -244,5 +262,32 @@ async def subscribe() -> StreamingResponse:
     headers = {"Cache-Control": "no-cache", "Content-Type": "text/event-stream", "Connection": "keep-alive"}
     logger.info("Distributor: subscriber connected sid=%s", sid)
     return StreamingResponse(sse_event_stream(sid), headers=headers, media_type="text/event-stream")
+
+
+@app.get("/stats")
+async def stats() -> JSONResponse:
+    """Lightweight metrics endpoint for demo validation."""
+    return JSONResponse({
+        "subscribers": len(subscriber_queues),
+        "group": CONSUMER_GROUP,
+        "consumer": CONSUMER_NAME,
+        "stream": STREAM_NAME,
+    })
+
+
+@app.get("/readyz")
+async def readyz() -> dict:
+    return await healthz()
+
+
+@app.get("/livez")
+async def livez() -> dict:
+    return {"status": "alive"}
+
+
+@app.get("/metrics")
+async def metrics() -> Response:
+    data = generate_latest()
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 

@@ -4,10 +4,11 @@ import logging
 from typing import Optional
 
 import orjson
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 
 STREAM_NAME = os.getenv("STREAM_NAME", "logs")
@@ -34,7 +35,7 @@ class LogEvent(BaseModel):
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("collector")
 
-app = FastAPI(title="Logs Collector", version="1.1")
+app = FastAPI(title="Logs Collector", version="1.2")
 
 # CORS: default to wildcard without credentials for browser compatibility
 ALLOWED_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
@@ -48,6 +49,12 @@ app.add_middleware(
 
 
 redis_client: Optional[Redis] = None
+
+# Metrics
+INGEST_TOTAL = Counter("collector_ingest_total", "Total ingested events")
+INGEST_BYTES = Counter("collector_ingest_bytes_total", "Total bytes ingested")
+INGEST_ERRORS = Counter("collector_ingest_errors_total", "Ingest errors", ["type"])
+INGEST_LATENCY = Histogram("collector_ingest_latency_seconds", "Ingest latency seconds")
 
 
 @app.on_event("startup")
@@ -83,16 +90,24 @@ async def ingest(event: LogEvent) -> dict:
         fields = event.to_redis_fields()
     except ValueError as e:
         logger.warning("Collector: payload too large from source=%s", event.source)
+        INGEST_ERRORS.labels(type="too_large").inc()
         raise HTTPException(status_code=413, detail=str(e)) from e
 
     # XADD with MAXLEN to cap stream length for demo stability
     try:
-        msg_id = await redis_client.xadd(name=STREAM_NAME, fields=fields, maxlen=TRIM_MAXLEN, approximate=True)
+        with INGEST_LATENCY.time():
+            msg_id = await redis_client.xadd(name=STREAM_NAME, fields=fields, maxlen=TRIM_MAXLEN, approximate=True)
     except Exception as exc:  # noqa: BLE001
+        INGEST_ERRORS.labels(type="xadd").inc()
         logger.exception("Collector: failed to XADD: %s", exc)
         raise HTTPException(status_code=500, detail=f"failed to write to stream: {exc}") from exc
     msg_id_str = msg_id.decode() if isinstance(msg_id, bytes) else msg_id
     logger.info("Collector: ingested id=%s level=%s source=%s", msg_id_str, event.level, event.source)
+    INGEST_TOTAL.inc()
+    try:
+        INGEST_BYTES.inc(len(fields["json"]))
+    except Exception:
+        pass
     return {"status": "ok", "id": msg_id_str}
 
 
@@ -125,8 +140,25 @@ async def healthz() -> dict:
     assert redis_client is not None
     try:
         pong = await redis_client.ping()
-        return {"status": "ok", "redis": pong}
+        return {"status": "ok", "redis": pong, "stream": STREAM_NAME}
     except Exception as exc:  # noqa: BLE001
         return {"status": "degraded", "error": str(exc)}
+
+
+@app.get("/readyz")
+async def readyz() -> dict:
+    # Same as health for this demo; could add deeper checks
+    return await healthz()
+
+
+@app.get("/livez")
+async def livez() -> dict:
+    return {"status": "alive"}
+
+
+@app.get("/metrics")
+async def metrics() -> Response:
+    data = generate_latest()
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 

@@ -22,6 +22,48 @@ open http://localhost:8080
 # Health
 curl -s localhost:8081/healthz | jq
 curl -s localhost:8082/healthz | jq
+
+### Smoke test
+
+Run a full end-to-end check from the host shell:
+
+```bash
+# subscribe in background and send a test event
+curl -sN http://localhost:8082/subscribe > /tmp/resolve_sse.txt &
+SSE_PID=$!
+sleep 1
+curl -s -X POST http://localhost:8081/ingest \
+  -H 'content-type: application/json' \
+  -d '{"source":"readme","level":"INFO","message":"hello from smoke test"}'
+sleep 1
+echo "SSE bytes captured:" $(wc -c < /tmp/resolve_sse.txt)
+tail -n +1 /tmp/resolve_sse.txt | sed -n '1,10p'
+kill $SSE_PID || true
+```
+
+### Scaling distributors
+
+- Compose already starts a second consumer `distributor2` in the same consumer group.
+- To scale further:
+
+```bash
+docker compose up -d --scale distributor=3
+```
+
+Each replica must have a distinct `CONSUMER_NAME` if not using Docker’s replica suffixing; for demo scale, defaults are fine.
+
+### Configuration
+
+All tunables are environment variables (see `docker-compose.yml`). Key ones:
+- `TRIM_MAXLEN` caps stream memory; tune upward for longer history.
+- `BATCH_COUNT` and `BLOCK_MS` control consumer latency vs throughput.
+- `PENDING_IDLE_MS` controls stale-claim timing for resiliency.
+
+### Operational notes
+
+- Containers include healthchecks and `restart: unless-stopped`.
+- Health-gated dependencies: Redis must be healthy; services retry Redis at startup.
+- SSE heartbeat (every 10s) keeps connections alive behind proxies.
 ```
 
 In the UI:
