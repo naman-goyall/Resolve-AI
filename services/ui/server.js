@@ -53,46 +53,62 @@ app.get('/', (_req, res) => {
         <div id="logs" class="logs"></div>
       </div>
     </div>
-    <script>
-      const distributor = '${DISTRIBUTOR_HTTP}'.replace(/\/$/, '');
-      const collector = location.origin.replace(':8080', ':8081');
+    <script type="text/javascript">
+      (function(){
+        var distributor = 'http://localhost:8082';
+        // Use absolute URLs to avoid mixed-origin surprises
+        var collector = 'http://localhost:8081';
 
-      document.getElementById('send').onclick = async () => {
-        const payload = {
-          source: document.getElementById('source').value,
-          level: document.getElementById('level').value,
-          message: document.getElementById('message').value,
-          ts_unix_ms: Date.now(),
+        var sendBtn = document.getElementById('send');
+        var connectBtn = document.getElementById('connect');
+        var sendStatus = document.getElementById('send-status');
+
+        sendBtn.onclick = function(){
+          var payload = {
+            source: document.getElementById('source').value,
+            level: document.getElementById('level').value,
+            message: document.getElementById('message').value,
+            ts_unix_ms: Date.now()
+          };
+          fetch(collector + '/ingest', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(payload),
+            mode: 'cors'
+          }).then(function(r){
+            sendStatus.textContent = r.ok ? ' ok' : ' error';
+            sendStatus.className = r.ok ? 'ok' : 'bad';
+          }).catch(function(err){
+            console.error('ingest error', err);
+            sendStatus.textContent = ' error';
+            sendStatus.className = 'bad';
+          });
         };
-        const el = document.getElementById('send-status');
-        try {
-          const r = await fetch(collector + '/ingest', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
-          const j = await r.json();
-          el.textContent = r.ok ? ' ok' : ' error';
-          el.className = r.ok ? 'ok' : 'bad';
-        } catch (e) {
-          el.textContent = ' error';
-          el.className = 'bad';
-        }
-      };
 
-      document.getElementById('connect').onclick = () => {
-        const status = document.getElementById('sse-status');
-        status.textContent = ' connecting...';
-        const ev = new EventSource(distributor + '/subscribe');
-        ev.onopen = () => { status.textContent = ' connected'; status.className = 'ok'; };
-        ev.onerror = () => { status.textContent = ' disconnected'; status.className = 'bad'; };
-        ev.onmessage = (m) => {
+        connectBtn.onclick = function(){
+          var statusEl = document.getElementById('sse-status');
+          statusEl.textContent = ' connecting...';
           try {
-            const data = JSON.parse(m.data);
-            const el = document.createElement('div');
-            el.textContent = '[' + (data.level||'') + '] ' + (data.source||'') + ': ' + (data.message||'');
-            const logs = document.getElementById('logs');
-            logs.appendChild(el);
-            logs.scrollTop = logs.scrollHeight;
-          } catch {}
+            var ev = new EventSource(distributor + '/subscribe');
+            ev.onopen = function(){ statusEl.textContent = ' connected'; statusEl.className = 'ok'; };
+            ev.onerror = function(){ statusEl.textContent = ' disconnected'; statusEl.className = 'bad'; };
+            ev.onmessage = function(m){
+              try {
+                var data = JSON.parse(m.data);
+                var el = document.createElement('div');
+                el.textContent = '[' + (data.level||'') + '] ' + (data.source||'') + ': ' + (data.message||'');
+                var logs = document.getElementById('logs');
+                logs.appendChild(el);
+                logs.scrollTop = logs.scrollHeight;
+              } catch(e) { console.error('parse error', e); }
+            };
+          } catch(e) {
+            console.error('EventSource error', e);
+            statusEl.textContent = ' error';
+            statusEl.className = 'bad';
+          }
         };
-      };
+      })();
     </script>
   </body>
  </html>`);

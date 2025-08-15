@@ -1,5 +1,6 @@
 import asyncio
 import os
+import logging
 from typing import Optional
 
 import orjson
@@ -30,12 +31,17 @@ class LogEvent(BaseModel):
         return {"json": data}
 
 
-app = FastAPI(title="Logs Collector", version="1.0")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("collector")
 
+app = FastAPI(title="Logs Collector", version="1.1")
+
+# CORS: default to wildcard without credentials for browser compatibility
+ALLOWED_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -48,11 +54,19 @@ redis_client: Optional[Redis] = None
 async def on_startup() -> None:
     global redis_client
     redis_client = Redis.from_url(REDIS_ADDR, decode_responses=False)
-    # Sanity ping
-    try:
-        await redis_client.ping()
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"Cannot connect to Redis at {REDIS_ADDR}: {exc}") from exc
+    # Retry ping for up to ~15s to tolerate container start order
+    backoff = 0.5
+    for _ in range(10):
+        try:
+            await redis_client.ping()
+            break
+        except Exception:  # noqa: BLE001
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 1.5, 2.0)
+    else:
+        logger.error("Collector: unable to connect to Redis at %s", REDIS_ADDR)
+        raise RuntimeError(f"Cannot connect to Redis at {REDIS_ADDR}")
+    logger.info("Collector: connected to Redis at %s, stream=%s", REDIS_ADDR, STREAM_NAME)
 
 
 @app.on_event("shutdown")
@@ -68,14 +82,42 @@ async def ingest(event: LogEvent) -> dict:
     try:
         fields = event.to_redis_fields()
     except ValueError as e:
+        logger.warning("Collector: payload too large from source=%s", event.source)
         raise HTTPException(status_code=413, detail=str(e)) from e
 
     # XADD with MAXLEN to cap stream length for demo stability
     try:
         msg_id = await redis_client.xadd(name=STREAM_NAME, fields=fields, maxlen=TRIM_MAXLEN, approximate=True)
     except Exception as exc:  # noqa: BLE001
+        logger.exception("Collector: failed to XADD: %s", exc)
         raise HTTPException(status_code=500, detail=f"failed to write to stream: {exc}") from exc
-    return {"status": "ok", "id": msg_id.decode() if isinstance(msg_id, bytes) else msg_id}
+    msg_id_str = msg_id.decode() if isinstance(msg_id, bytes) else msg_id
+    logger.info("Collector: ingested id=%s level=%s source=%s", msg_id_str, event.level, event.source)
+    return {"status": "ok", "id": msg_id_str}
+
+
+@app.post("/ingest/bulk")
+async def ingest_bulk(events: list[LogEvent]) -> dict:
+    assert redis_client is not None
+    if not events:
+        return {"status": "ok", "count": 0}
+    pairs = []
+    try:
+        for ev in events:
+            pairs.append((STREAM_NAME, ev.to_redis_fields()))
+    except ValueError as e:
+        raise HTTPException(status_code=413, detail=str(e)) from e
+    # Use pipeline for efficiency
+    pipe = redis_client.pipeline()
+    for name, fields in pairs:
+        pipe.xadd(name=name, fields=fields, maxlen=TRIM_MAXLEN, approximate=True)
+    try:
+        ids = await pipe.execute()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Collector: bulk XADD failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"failed to write to stream: {exc}") from exc
+    logger.info("Collector: bulk ingested %d events", len(ids))
+    return {"status": "ok", "count": len(ids)}
 
 
 @app.get("/healthz")

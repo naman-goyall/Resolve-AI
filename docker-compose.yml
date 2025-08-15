@@ -18,6 +18,7 @@ services:
       - STREAM_NAME=logs
       - MAX_MESSAGE_BYTES=65536
       - TRIM_MAXLEN=50000
+      - CORS_ALLOW_ORIGINS=http://localhost:8080
     depends_on:
       - redis
     ports:
@@ -36,11 +37,28 @@ services:
       - BATCH_COUNT=128
       - BLOCK_MS=2000
       - SUBSCRIBER_QUEUE_LEN=1000
-      - CORS_ALLOW_ORIGINS=*
+      - CORS_ALLOW_ORIGINS=http://localhost:8080
     depends_on:
       - redis
     ports:
       - "8082:8082"
+
+  distributor2:
+    build:
+      context: .
+      dockerfile: ./services/distributor/Dockerfile
+    environment:
+      - REDIS_ADDR=redis://redis:6379/0
+      - STREAM_NAME=logs
+      - CONSUMER_GROUP=distributors
+      - CONSUMER_NAME=dist-2
+      - PENDING_IDLE_MS=60000
+      - BATCH_COUNT=128
+      - BLOCK_MS=2000
+      - SUBSCRIBER_QUEUE_LEN=1000
+      - CORS_ALLOW_ORIGINS=http://localhost:8080
+    depends_on:
+      - redis
 
   ui:
     build:
