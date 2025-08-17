@@ -5,6 +5,7 @@ This repo contains a complete, Dockerized logs pipeline using Redis Streams and 
 - `collector` (FastAPI): HTTP ingest endpoint `/ingest` that writes events to a Redis Stream with bounded length.
 - `distributor` (FastAPI): Consumes the stream via Redis consumer groups and broadcasts to connected clients using SSE at `/subscribe`.
 - `ui` (Node/Express): Minimal UI to send test events and view the live stream.
+- `analyzer` (FastAPI x2): Durable consumers of per-analyzer streams (`analyzer:an1`, `analyzer:an2`) demonstrating offline catch-up and weighted routing.
 
 ### Requirements
 
@@ -22,6 +23,8 @@ open http://localhost:8080
 # Health
 curl -s localhost:8081/healthz | jq
 curl -s localhost:8082/healthz | jq
+curl -s localhost:8091/healthz | jq
+curl -s localhost:8092/healthz | jq
 
 ### Smoke test
 
@@ -40,6 +43,54 @@ echo "SSE bytes captured:" $(wc -c < /tmp/resolve_sse.txt)
 tail -n +1 /tmp/resolve_sse.txt | sed -n '1,10p'
 kill $SSE_PID || true
 ```
+
+### Weighted distribution demo
+
+The distributor routes each log to one analyzer stream by weight.
+
+Default weights: `an1:2`, `an2:1` (set via `ANALYZERS` env in compose).
+
+1) Send 300 logs:
+```bash
+for i in $(seq 1 300); do curl -s -X POST http://localhost:8081/ingest -H 'content-type: application/json' \
+  -d "{\"source\":\"weight\",\"level\":\"INFO\",\"message\":\"m-$i\"}" >/dev/null; done
+```
+2) After a few seconds, check analyzer metrics:
+```bash
+curl -s http://localhost:8091/metrics | rg analyzer_processed_total | cat
+curl -s http://localhost:8092/metrics | rg analyzer_processed_total | cat
+```
+`an1` should be roughly ~2/3 of total; `an2` ~1/3.
+
+### Analyzer offline/online demo
+
+1) Stop `analyzer2`:
+```bash
+docker compose stop analyzer2
+```
+2) Send 50 logs (they will be queued in `analyzer:an2` stream):
+```bash
+for i in $(seq 1 50); do curl -s -X POST http://localhost:8081/ingest -H 'content-type: application/json' \
+  -d "{\"source\":\"offline\",\"level\":\"INFO\",\"message\":\"m-$i\"}" >/dev/null; done
+```
+3) Start `analyzer2` and observe it catch up:
+```bash
+docker compose start analyzer2
+```
+Check `analyzer2` metrics/health until processed increases and health is OK.
+
+### Throughput demo
+
+Use the bulk endpoint to push load:
+```bash
+python - <<'PY'
+import requests, json
+payload = [{"source":"load","level":"INFO","message":f"m-{i}"} for i in range(2000)]
+r = requests.post('http://localhost:8081/ingest/bulk', json=payload)
+print(r.status_code, r.text[:120])
+PY
+```
+Watch distributor and analyzer metrics at `/metrics`.
 
 ### Scaling distributors
 

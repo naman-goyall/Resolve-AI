@@ -51,6 +51,7 @@ services:
       - BATCH_COUNT=128
       - BLOCK_MS=2000
       - SUBSCRIBER_QUEUE_LEN=1000
+      - ANALYZERS=[{"name":"an1","weight":2},{"name":"an2","weight":1}]
       - CORS_ALLOW_ORIGINS=http://localhost:8080
     depends_on:
       - redis
@@ -77,6 +78,7 @@ services:
       - BATCH_COUNT=128
       - BLOCK_MS=2000
       - SUBSCRIBER_QUEUE_LEN=1000
+      - ANALYZERS=[{"name":"an1","weight":2},{"name":"an2","weight":1}]
       - CORS_ALLOW_ORIGINS=http://localhost:8080
     depends_on:
       - redis
@@ -104,6 +106,52 @@ services:
       start_period: 5s
     ports:
       - "8080:8080"
+
+  analyzer1:
+    build:
+      context: .
+      dockerfile: ./services/analyzer/Dockerfile
+    restart: unless-stopped
+    environment:
+      - REDIS_ADDR=redis://redis:6379/0
+      - ANALYZER_NAME=an1
+      - ANALYZER_GROUP=analyzers
+      - CONSUMER_NAME=an1-c1
+      - BATCH_COUNT=256
+      - BLOCK_MS=2000
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8090/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    ports:
+      - "8091:8090"
+
+  analyzer2:
+    build:
+      context: .
+      dockerfile: ./services/analyzer/Dockerfile
+    restart: unless-stopped
+    environment:
+      - REDIS_ADDR=redis://redis:6379/0
+      - ANALYZER_NAME=an2
+      - ANALYZER_GROUP=analyzers
+      - CONSUMER_NAME=an2-c1
+      - BATCH_COUNT=256
+      - BLOCK_MS=2000
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8090/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    ports:
+      - "8092:8090"
 
 volumes:
   redis-data:

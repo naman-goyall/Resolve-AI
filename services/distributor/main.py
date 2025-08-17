@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from redis.asyncio import Redis
+import json
+import zlib
 
 
 STREAM_NAME = os.getenv("STREAM_NAME", "logs")
@@ -22,6 +24,7 @@ BATCH_COUNT = int(os.getenv("BATCH_COUNT", "128"))
 BLOCK_MS = int(os.getenv("BLOCK_MS", "2000"))
 SUBSCRIBER_QUEUE_LEN = int(os.getenv("SUBSCRIBER_QUEUE_LEN", "1000"))
 BROADCAST_CHANNEL = os.getenv("BROADCAST_CHANNEL", "logs_broadcast")
+ANALYZERS_JSON = os.getenv("ANALYZERS", "[{'name':'an1','weight':2},{'name':'an2','weight':1}]")
 
 ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
 
@@ -50,6 +53,31 @@ pubsub_obj = None
 PUB_TOTAL = Counter("distributor_published_total", "Total events published to subscribers")
 PUB_ERRORS = Counter("distributor_errors_total", "Distributor errors", ["where"])
 SSE_CONNECTIONS = Gauge("distributor_sse_connections", "Active SSE connections")
+
+# Weighted routing config (deterministic hashing)
+try:
+    # Support both JSON and Python-like single quotes for convenience
+    ANALYZERS = json.loads(ANALYZERS_JSON.replace("'", '"'))
+except Exception:
+    ANALYZERS = [{"name": "an1", "weight": 2}, {"name": "an2", "weight": 1}]
+_weights: List[Tuple[int, str]] = []  # (upper_bound, name)
+_total_weight = 0
+for a in ANALYZERS:
+    w = int(a.get("weight", 1))
+    if w <= 0:
+        continue
+    _total_weight += w
+    _weights.append((_total_weight, a["name"]))
+
+
+def choose_analyzer(raw_json: bytes) -> str:
+    if not _weights:
+        return "an1"
+    h = zlib.crc32(raw_json) % _total_weight
+    for upper, name in _weights:
+        if h < upper:
+            return name
+    return _weights[-1][1]
 
 
 async def ensure_group(redis: Redis) -> None:
@@ -124,6 +152,14 @@ async def consume_loop() -> None:
                 except Exception as exc:
                     logger.exception("Distributor: publish failed: %s", exc)
                     PUB_ERRORS.labels(where="publish").inc()
+                # Route deterministically to analyzer stream by weight
+                try:
+                    target = choose_analyzer(raw)
+                    stream_name = f"analyzer:{target}"
+                    await redis_client.xadd(name=stream_name, fields={b"json": raw})
+                except Exception as exc:
+                    logger.exception("Distributor: route to analyzer failed: %s", exc)
+                    PUB_ERRORS.labels(where="route").inc()
                 ids_to_ack.append(msg_id)
 
             if ids_to_ack:
